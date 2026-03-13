@@ -1,26 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  RefreshControl,
-  ScrollView,
-  Switch,
-  Text,
-  TouchableOpacity,
-  View,
-} from "react-native";
+import React, { useEffect, useState } from "react";
+import { ScrollView, Text, TouchableOpacity, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import CaixaDagua from "./components/CaixaDagua";
-
-const MOCK_DELAY = 500;
-const API_BASE_URL = "http://192.168.0.10:80";
+import { database, ref, onValue, set } from "./firebase";
 
 const initialStatus = {
-  nivelPercentual: 15,
-  bombaLigada: true,
-  chave: "remoto", // local | remoto
-  operacao: "automatico", // automatico | override_on | override_off
+  nivelPercentual: 0,
+  bombaLigada: false,
+  chave: "remoto",
+  operacao: "automatico",
   permiteComandoApp: true,
   tempoRestanteSegundos: 0,
-  ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
+  ultimaAtualizacao: "--:--:--",
 };
 
 function formatarTempo(segundos) {
@@ -51,185 +42,56 @@ function corNivel(nivel) {
   return "#38bdf8";
 }
 
-async function mockFetchStatus(current) {
-  await new Promise((resolve) => setTimeout(resolve, MOCK_DELAY));
-
-  const variacao = Math.random() > 0.5 ? 1 : -1;
-  const novoNivel = Math.min(
-    100,
-    Math.max(0, current.nivelPercentual + variacao * 2),
-  );
-
-  const proximo = {
-    ...current,
-    nivelPercentual: novoNivel,
-    ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-  };
-
-  if (proximo.operacao === "automatico") {
-    if (novoNivel <= 20) proximo.bombaLigada = true;
-    else if (novoNivel >= 95) proximo.bombaLigada = false;
-  }
-
-  return proximo;
-}
-
 export default function App() {
   const [status, setStatus] = useState(initialStatus);
-  const [refreshing, setRefreshing] = useState(false);
   const [loadingAction, setLoadingAction] = useState(false);
-  const [usarMock, setUsarMock] = useState(true);
-
-  const barraNivelWidth = useMemo(
-    () => `${status.nivelPercentual}%`,
-    [status.nivelPercentual],
-  );
-
-  const carregarStatus = useCallback(async () => {
-    setRefreshing(true);
-
-    try {
-      if (usarMock) {
-        const next = await mockFetchStatus(status);
-        setStatus(next);
-      } else {
-        const response = await fetch(`${API_BASE_URL}/status`);
-        const data = await response.json();
-
-        setStatus({
-          nivelPercentual: data.nivelPercentual,
-          bombaLigada: data.bombaLigada,
-          chave: data.chave,
-          operacao: data.operacao,
-          permiteComandoApp: data.permiteComandoApp,
-          tempoRestanteSegundos: data.tempoRestanteSegundos,
-          ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-        });
-      }
-    } catch (error) {
-      console.log("Erro ao carregar status:", error);
-    } finally {
-      setRefreshing(false);
-    }
-  }, [status, usarMock]);
-
-  const enviarComando = useCallback(
-    async (acao) => {
-      if (!status.permiteComandoApp) return;
-
-      setLoadingAction(true);
-
-      try {
-        if (usarMock) {
-          await new Promise((resolve) => setTimeout(resolve, MOCK_DELAY));
-
-          if (acao === "on") {
-            setStatus((prev) => ({
-              ...prev,
-              bombaLigada: true,
-              operacao: "override_on",
-              tempoRestanteSegundos: 120,
-              ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-            }));
-          }
-
-          if (acao === "off") {
-            setStatus((prev) => ({
-              ...prev,
-              bombaLigada: false,
-              operacao: "override_off",
-              tempoRestanteSegundos: 120,
-              ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-            }));
-          }
-
-          if (acao === "cancel") {
-            setStatus((prev) => ({
-              ...prev,
-              operacao: "automatico",
-              tempoRestanteSegundos: 0,
-              ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-            }));
-          }
-        } else {
-          const endpoint =
-            acao === "on"
-              ? "/override/on"
-              : acao === "off"
-                ? "/override/off"
-                : "/override/cancel";
-
-          await fetch(`${API_BASE_URL}${endpoint}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body:
-              acao === "cancel" ? undefined : JSON.stringify({ duracao: 120 }),
-          });
-
-          await carregarStatus();
-        }
-      } catch (error) {
-        console.log("Erro ao enviar comando:", error);
-      } finally {
-        setLoadingAction(false);
-      }
-    },
-    [carregarStatus, status.permiteComandoApp, usarMock],
-  );
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setStatus((prev) => {
-        if (prev.tempoRestanteSegundos <= 0) return prev;
+    const statusRef = ref(database, "nivelBomba");
 
-        const restante = prev.tempoRestanteSegundos - 1;
+    const unsubscribe = onValue(statusRef, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
 
-        if (restante <= 0) {
-          let bombaLigada = prev.bombaLigada;
-
-          if (prev.nivelPercentual <= 20) bombaLigada = true;
-          else if (prev.nivelPercentual >= 95) bombaLigada = false;
-
-          return {
-            ...prev,
-            bombaLigada,
-            operacao: "automatico",
-            tempoRestanteSegundos: 0,
-            ultimaAtualizacao: new Date().toLocaleTimeString("pt-BR"),
-          };
-        }
-
-        return {
-          ...prev,
-          tempoRestanteSegundos: restante,
-        };
+      setStatus({
+        nivelPercentual: data.nivelPercentual ?? 0,
+        bombaLigada: data.bombaLigada ?? false,
+        chave: data.chave ?? "remoto",
+        operacao: data.operacao ?? "automatico",
+        permiteComandoApp: data.permiteComandoApp ?? true,
+        tempoRestanteSegundos: data.tempoRestanteSegundos ?? 0,
+        ultimaAtualizacao: data.ultimaAtualizacao ?? "--:--:--",
       });
-    }, 1000);
+    });
 
-    return () => clearInterval(timer);
+    return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
-    const poll = setInterval(() => {
-      carregarStatus();
-    }, 5000);
+  async function enviarComando(acao) {
+    if (!status.permiteComandoApp) return;
 
-    return () => clearInterval(poll);
-  }, [carregarStatus]);
+    setLoadingAction(true);
 
+    try {
+      await set(ref(database, "comandos/override"), {
+        acao,
+        duracao: acao === "cancel" ? 0 : 120,
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      console.log("Erro ao enviar comando:", error);
+    } finally {
+      setLoadingAction(false);
+    }
+  }
+
+  const barraNivelWidth = `${status.nivelPercentual}%`;
   const botoesDesabilitados = !status.permiteComandoApp || loadingAction;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: "#0f172a" }}>
       <ScrollView
         contentContainerStyle={{ padding: 20, gap: 16, paddingBottom: 40 }}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={carregarStatus}
-            tintColor="#ffffff"
-          />
-        }
       >
         <View
           style={{
@@ -239,17 +101,27 @@ export default function App() {
             marginTop: 12,
             borderWidth: 1,
             borderColor: "#1f2937",
+            alignItems: "center",
           }}
         >
           <CaixaDagua nivel={status.nivelPercentual} size={220} />
 
-          <Text style={{ color: "#ffffff", fontSize: 30, fontWeight: "700" }}>
+          <Text
+            style={{
+              color: "#ffffff",
+              fontSize: 30,
+              fontWeight: "700",
+              marginTop: 8,
+              textAlign: "center",
+            }}
+          >
             {status.nivelPercentual.toFixed(0)}%
           </Text>
 
           <View
             style={{
               height: 16,
+              width: "100%",
               backgroundColor: "#1f2937",
               borderRadius: 999,
               overflow: "hidden",
@@ -266,7 +138,13 @@ export default function App() {
             />
           </View>
 
-          <Text style={{ color: "#94a3b8", marginTop: 12 }}>
+          <Text
+            style={{
+              color: "#94a3b8",
+              marginTop: 12,
+              textAlign: "center",
+            }}
+          >
             Liga em 20% • Desliga em 95% • Entre esses valores mantém o último
             estado.
           </Text>
@@ -400,12 +278,9 @@ export default function App() {
 
           <TouchableOpacity
             onPress={() => enviarComando("cancel")}
-            disabled={botoesDesabilitados || status.tempoRestanteSegundos <= 0}
+            disabled={botoesDesabilitados}
             style={{
-              backgroundColor:
-                botoesDesabilitados || status.tempoRestanteSegundos <= 0
-                  ? "#374151"
-                  : "#2563eb",
+              backgroundColor: botoesDesabilitados ? "#374151" : "#2563eb",
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
@@ -428,39 +303,16 @@ export default function App() {
           }}
         >
           <Text style={{ color: "#ffffff", fontSize: 18, fontWeight: "700" }}>
-            Ambiente
+            Firebase
           </Text>
-
-          <View
-            style={{
-              flexDirection: "row",
-              justifyContent: "space-between",
-              alignItems: "center",
-            }}
-          >
-            <View style={{ flex: 1, paddingRight: 16 }}>
-              <Text
-                style={{ color: "#ffffff", fontSize: 16, fontWeight: "600" }}
-              >
-                Usar dados mockados
-              </Text>
-              <Text style={{ color: "#94a3b8", marginTop: 4 }}>
-                Mantenha ligado enquanto o ESP32 ainda não estiver disponível.
-              </Text>
-            </View>
-
-            <Switch value={usarMock} onValueChange={setUsarMock} />
-          </View>
 
           <Text style={{ color: "#94a3b8" }}>
             Última atualização: {status.ultimaAtualizacao}
           </Text>
 
-          {!usarMock && (
-            <Text style={{ color: "#94a3b8" }}>
-              Base da API: {API_BASE_URL}
-            </Text>
-          )}
+          <Text style={{ color: "#94a3b8" }}>
+            Fonte de dados: Firebase Realtime Database
+          </Text>
         </View>
       </ScrollView>
     </SafeAreaView>
