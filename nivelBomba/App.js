@@ -41,10 +41,21 @@ function corNivel(nivel) {
   if (nivel >= 95) return "#22c55e";
   return "#38bdf8";
 }
+function calculaEstados(nivel, estadoAtual, chave, operacao) {
+  if (chave === "local") {
+    return estadoAtual;
+  }
+  if (operacao === "override_on") return true;
+  if (operacao === "override_off") return false;
+  if (nivel <= 20) return true;
+  if (nivel >= 95) return false;
+  return estadoAtual;
+}
 
 export default function App() {
   const [status, setStatus] = useState(initialStatus);
   const [loadingAction, setLoadingAction] = useState(false);
+  const [tempoLocalOverride, setTempoLocalOverride] = useState(0);
 
   useEffect(() => {
     const statusRef = ref(database, "nivelBomba");
@@ -52,30 +63,137 @@ export default function App() {
     const unsubscribe = onValue(statusRef, (snapshot) => {
       const data = snapshot.val();
       if (!data) return;
+      const nivel = data.nivelPercentual ?? 0;
+      const estadoAtual = data.bombaLigada ?? false;
+      const chave = data.chave ?? "remoto";
+      const operacao = data.operacao ?? "automatico";
+      const novoEstado = calculaEstados(nivel, estadoAtual, chave, operacao);
 
       setStatus({
-        nivelPercentual: data.nivelPercentual ?? 0,
-        bombaLigada: data.bombaLigada ?? false,
-        chave: data.chave ?? "remoto",
-        operacao: data.operacao ?? "automatico",
+        nivelPercentual: nivel,
+        bombaLigada: novoEstado,
+        chave: chave,
+        operacao: operacao,
         permiteComandoApp: data.permiteComandoApp ?? true,
         tempoRestanteSegundos: data.tempoRestanteSegundos ?? 0,
         ultimaAtualizacao: data.ultimaAtualizacao ?? "--:--:--",
       });
+
+      if (novoEstado !== estadoAtual) {
+        set(ref(database, "nivelBomba/bombaLigada"), novoEstado);
+      }
     });
 
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    const overrideRef = ref(database, "comandos/override");
+
+    const unsubscribe = onValue(overrideRef, async (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
+
+      const acao = data.acao ?? "none";
+
+      if (acao === "none") return;
+      if (status.chave === "local") return;
+
+      try {
+        if (acao === "on") {
+          await set(ref(database, "nivelBomba/operacao"), "override_on");
+          await set(
+            ref(database, "nivelBomba/tempoRestanteSegundos"),
+            data.duracao ?? 10,
+          );
+        }
+
+        if (acao === "off") {
+          await set(ref(database, "nivelBomba/operacao"), "override_off");
+          await set(
+            ref(database, "nivelBomba/tempoRestanteSegundos"),
+            data.duracao ?? 10,
+          );
+        }
+
+        if (acao === "cancel") {
+          await set(ref(database, "nivelBomba/operacao"), "automatico");
+          await set(ref(database, "nivelBomba/tempoRestanteSegundos"), 0);
+        }
+
+        await set(ref(database, "comandos/override"), {
+          acao: "none",
+          duracao: 0,
+          timestamp: Date.now(),
+        });
+      } catch (error) {
+        console.log("Erro ao processar override:", error);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [status.chave]);
+
+  useEffect(() => {
+    if (
+      status.operacao === "override_on" ||
+      status.operacao === "override_off"
+    ) {
+      setTempoLocalOverride(status.tempoRestanteSegundos ?? 0);
+    } else {
+      setTempoLocalOverride(0);
+    }
+  }, [status.operacao, status.tempoRestanteSegundos]);
+
+  useEffect(() => {
+    if (
+      status.operacao !== "override_on" &&
+      status.operacao !== "override_off"
+    ) {
+      return;
+    }
+
+    if (tempoLocalOverride <= 0) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      const novoTempo = tempoLocalOverride - 1;
+
+      setTempoLocalOverride(novoTempo);
+
+      if (novoTempo <= 0) {
+        try {
+          await set(ref(database, "nivelBomba/operacao"), "automatico");
+          await set(ref(database, "nivelBomba/tempoRestanteSegundos"), 0);
+        } catch (error) {
+          console.log("Erro ao finalizar override:", error);
+        }
+      }
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [status.operacao, tempoLocalOverride]);
+
   async function enviarComando(acao) {
-    if (!status.permiteComandoApp) return;
+    if (!status.permiteComandoApp || status.chave === "local") return;
+
+    if (acao === "on" && status.operacao === "override_on") return;
+    if (acao === "off" && status.operacao === "override_off") return;
+    if (
+      acao === "cancel" &&
+      status.operacao !== "override_on" &&
+      status.operacao !== "override_off"
+    ) {
+      return;
+    }
 
     setLoadingAction(true);
 
     try {
       await set(ref(database, "comandos/override"), {
         acao,
-        duracao: acao === "cancel" ? 0 : 120,
+        duracao: acao === "cancel" ? 0 : 10,
         timestamp: Date.now(),
       });
     } catch (error) {
@@ -86,7 +204,20 @@ export default function App() {
   }
 
   const barraNivelWidth = `${status.nivelPercentual}%`;
-  const botoesDesabilitados = !status.permiteComandoApp || loadingAction;
+
+  const controleBloqueado =
+    status.chave === "local" || !status.permiteComandoApp || loadingAction;
+
+  const overrideLigando = status.operacao === "override_on";
+  const overrideDesligando = status.operacao === "override_off";
+  const overrideAtivo = overrideLigando || overrideDesligando;
+
+  const desabilitarLigar =
+    controleBloqueado || overrideLigando || status.bombaLigada;
+  const desabilitarDesligar =
+    controleBloqueado || overrideDesligando || !status.bombaLigada;
+  const desabilitarCancelar =
+    controleBloqueado || !overrideAtivo || tempoLocalOverride <= 0;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: "#0f172a" }}>
@@ -216,10 +347,9 @@ export default function App() {
             {labelOperacao(status.operacao)}
           </Text>
 
-          {status.tempoRestanteSegundos > 0 && (
+          {tempoLocalOverride > 0 && (
             <Text style={{ color: "#fbbf24", fontSize: 15 }}>
-              Tempo restante do override:{" "}
-              {formatarTempo(status.tempoRestanteSegundos)}
+              Tempo restante do override: {formatarTempo(tempoLocalOverride)}
             </Text>
           )}
 
@@ -248,9 +378,9 @@ export default function App() {
 
           <TouchableOpacity
             onPress={() => enviarComando("on")}
-            disabled={botoesDesabilitados}
+            disabled={desabilitarLigar}
             style={{
-              backgroundColor: botoesDesabilitados ? "#374151" : "#16a34a",
+              backgroundColor: desabilitarLigar ? "#374151" : "#16a34a",
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
@@ -263,9 +393,9 @@ export default function App() {
 
           <TouchableOpacity
             onPress={() => enviarComando("off")}
-            disabled={botoesDesabilitados}
+            disabled={desabilitarDesligar}
             style={{
-              backgroundColor: botoesDesabilitados ? "#374151" : "#dc2626",
+              backgroundColor: desabilitarDesligar ? "#374151" : "#dc2626",
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
@@ -278,9 +408,9 @@ export default function App() {
 
           <TouchableOpacity
             onPress={() => enviarComando("cancel")}
-            disabled={botoesDesabilitados}
+            disabled={desabilitarCancelar}
             style={{
-              backgroundColor: botoesDesabilitados ? "#374151" : "#2563eb",
+              backgroundColor: desabilitarCancelar ? "#374151" : "#2563eb",
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
